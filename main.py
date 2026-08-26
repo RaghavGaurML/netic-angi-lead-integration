@@ -1,6 +1,10 @@
 import json
+import os
+import smtplib
 import sqlite3
+import ssl
 from contextlib import asynccontextmanager
+from email.message import EmailMessage
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -69,10 +73,20 @@ def init_db() -> None:
                 urgency TEXT NOT NULL,
                 raw_payload TEXT NOT NULL,
                 received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                email_status TEXT NOT NULL DEFAULT 'pending'
+                email_status TEXT NOT NULL DEFAULT 'pending',
+                email_sent_at TEXT,
+                email_error TEXT
             )
             """
         )
+
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(leads)")
+        }
+        if "email_sent_at" not in columns:
+            connection.execute("ALTER TABLE leads ADD COLUMN email_sent_at TEXT")
+        if "email_error" not in columns:
+            connection.execute("ALTER TABLE leads ADD COLUMN email_error TEXT")
 
 
 def insert_lead(lead: AngiLead, tenant_id: str, raw_payload: dict) -> int:
@@ -109,6 +123,76 @@ def insert_lead(lead: AngiLead, tenant_id: str, raw_payload: dict) -> int:
         return cursor.lastrowid
 
 
+def send_intro_email(lead: AngiLead) -> None:
+    required_settings = (
+        "SMTP_HOST",
+        "SMTP_PORT",
+        "SMTP_USERNAME",
+        "SMTP_PASSWORD",
+        "EMAIL_FROM",
+    )
+    settings = {name: os.getenv(name) for name in required_settings}
+    missing = [name for name, value in settings.items() if not value]
+    if missing:
+        raise RuntimeError(
+            f"Missing required SMTP configuration: {', '.join(missing)}"
+        )
+
+    try:
+        smtp_port = int(settings["SMTP_PORT"])
+    except ValueError as error:
+        raise RuntimeError("SMTP_PORT must be an integer") from error
+
+    message = EmailMessage()
+    message["Subject"] = "Thanks for contacting us"
+    message["From"] = settings["EMAIL_FROM"]
+    message["To"] = lead.email
+    message.set_content(
+        f"Hi {lead.first_name},\n\n"
+        f"Thanks for reaching out about your {lead.category} request. "
+        "We received your request and would be happy to help you get an "
+        "appointment scheduled.\n\n"
+        "Best,\n"
+        "The scheduling team"
+    )
+
+    with smtplib.SMTP(settings["SMTP_HOST"], smtp_port, timeout=10) as smtp:
+        smtp.ehlo()
+        smtp.starttls(context=ssl.create_default_context())
+        smtp.ehlo()
+        smtp.login(settings["SMTP_USERNAME"], settings["SMTP_PASSWORD"])
+        refused_recipients = smtp.send_message(message)
+
+    if refused_recipients:
+        raise smtplib.SMTPRecipientsRefused(refused_recipients)
+
+
+def mark_email_sent(lead_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            """
+            UPDATE leads
+            SET email_status = 'sent',
+                email_sent_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                email_error = NULL
+            WHERE id = ?
+            """,
+            (lead_id,),
+        )
+
+
+def mark_email_failed(lead_id: int, error: Exception) -> None:
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            """
+            UPDATE leads
+            SET email_status = 'failed', email_sent_at = NULL, email_error = ?
+            WHERE id = ?
+            """,
+            (str(error), lead_id),
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
@@ -126,4 +210,15 @@ async def receive_angi_lead(lead: AngiLead, request: Request) -> LeadAccepted:
 
     raw_payload = await request.json()
     lead_id = insert_lead(lead, tenant_id, raw_payload)
+
+    try:
+        send_intro_email(lead)
+    except Exception as error:
+        mark_email_failed(lead_id, error)
+        raise HTTPException(
+            status_code=502,
+            detail="Lead stored, but introductory email could not be sent",
+        ) from error
+
+    mark_email_sent(lead_id)
     return LeadAccepted(status="success", lead_id=lead_id, tenant_id=tenant_id)
