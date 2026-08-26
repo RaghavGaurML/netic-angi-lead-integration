@@ -50,6 +50,16 @@ class LeadAccepted(BaseModel):
     tenant_id: str
 
 
+class AngiAnalytics(BaseModel):
+    total_leads: int
+    emails_sent: int
+    email_failures: int
+    email_success_rate: float | None
+    average_speed_to_lead_seconds: float | None
+    leads_by_category: dict[str, int]
+    leads_by_urgency: dict[str, int]
+
+
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute(
@@ -248,6 +258,57 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Netic Angi Lead Integration", lifespan=lifespan)
+
+
+@app.get("/analytics/angi", response_model=AngiAnalytics)
+def get_angi_analytics() -> AngiAnalytics:
+    with sqlite3.connect(DB_PATH) as connection:
+        total_leads, emails_sent, email_failures, average_speed = (
+            connection.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(email_status = 'sent'), 0),
+                    COALESCE(SUM(email_status = 'failed'), 0),
+                    AVG(
+                        CASE
+                            WHEN email_status = 'sent' AND email_sent_at IS NOT NULL
+                            THEN (julianday(email_sent_at) - julianday(received_at))
+                                 * 86400.0
+                        END
+                    )
+                FROM leads
+                """
+            ).fetchone()
+        )
+        leads_by_category = dict(
+            connection.execute(
+                "SELECT category, COUNT(*) FROM leads GROUP BY category"
+            ).fetchall()
+        )
+        leads_by_urgency = dict(
+            connection.execute(
+                "SELECT urgency, COUNT(*) FROM leads GROUP BY urgency"
+            ).fetchall()
+        )
+
+    completed_attempts = emails_sent + email_failures
+    success_rate = (
+        round(emails_sent / completed_attempts, 4)
+        if completed_attempts
+        else None
+    )
+    return AngiAnalytics(
+        total_leads=total_leads,
+        emails_sent=emails_sent,
+        email_failures=email_failures,
+        email_success_rate=success_rate,
+        average_speed_to_lead_seconds=(
+            round(average_speed, 4) if average_speed is not None else None
+        ),
+        leads_by_category=leads_by_category,
+        leads_by_urgency=leads_by_urgency,
+    )
 
 
 @app.post("/webhooks/angi", response_model=LeadAccepted)

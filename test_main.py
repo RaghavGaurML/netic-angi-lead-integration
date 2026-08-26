@@ -219,3 +219,75 @@ def test_missing_required_field_does_not_persist_or_send(tmp_path, monkeypatch):
 
     assert row_count == 0
     smtp_class.assert_not_called()
+
+
+def test_analytics_reports_outreach_funnel_and_grouped_counts(tmp_path, monkeypatch):
+    database_path = tmp_path / "test_leads.db"
+    monkeypatch.setattr(main, "DB_PATH", database_path)
+    main.init_db()
+
+    lead_variants = [
+        {**SAMPLE_LEAD, "CorrelationId": "analytics-1"},
+        {
+            **SAMPLE_LEAD,
+            "CorrelationId": "analytics-2",
+            "Urgency": "Flexible",
+        },
+        {
+            **SAMPLE_LEAD,
+            "CorrelationId": "analytics-3",
+            "Category": "Indianapolis - Plumbing",
+        },
+    ]
+    lead_ids = [
+        main.insert_lead(
+            main.AngiLead.model_validate(payload), "tenant_001", payload
+        )
+        for payload in lead_variants
+    ]
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE leads
+            SET email_status = 'sent',
+                received_at = '2026-01-01 12:00:00',
+                email_sent_at = '2026-01-01T12:00:02.000Z'
+            WHERE id = ?
+            """,
+            (lead_ids[0],),
+        )
+        connection.execute(
+            """
+            UPDATE leads
+            SET email_status = 'sent',
+                received_at = '2026-01-01 12:00:00',
+                email_sent_at = '2026-01-01T12:00:04.000Z'
+            WHERE id = ?
+            """,
+            (lead_ids[1],),
+        )
+        connection.execute(
+            "UPDATE leads SET email_status = 'failed' WHERE id = ?",
+            (lead_ids[2],),
+        )
+
+    with TestClient(main.app) as client:
+        response = client.get("/analytics/angi")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "total_leads": 3,
+        "emails_sent": 2,
+        "email_failures": 1,
+        "email_success_rate": 0.6667,
+        "average_speed_to_lead_seconds": 3.0,
+        "leads_by_category": {
+            "Indianapolis - House Cleaning": 2,
+            "Indianapolis - Plumbing": 1,
+        },
+        "leads_by_urgency": {
+            "This Week": 2,
+            "Flexible": 1,
+        },
+    }
