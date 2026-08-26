@@ -178,3 +178,44 @@ def test_pending_lead_is_reused_without_sending(tmp_path, monkeypatch):
 
     assert rows == [(existing_lead_id, "pending")]
     smtp_class.assert_not_called()
+
+
+def test_unknown_tenant_does_not_persist_or_send(tmp_path, monkeypatch):
+    database_path = tmp_path / "test_leads.db"
+    monkeypatch.setattr(main, "DB_PATH", database_path)
+    unknown_tenant_lead = {**SAMPLE_LEAD, "ALAccountId": "999999"}
+
+    with patch("main.smtplib.SMTP") as smtp_class:
+        with TestClient(main.app) as client:
+            response = client.post("/webhooks/angi", json=unknown_tenant_lead)
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": "No tenant mapped for ALAccountId"
+    }
+    with sqlite3.connect(database_path) as connection:
+        row_count = connection.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+
+    assert row_count == 0
+    smtp_class.assert_not_called()
+
+
+def test_missing_required_field_does_not_persist_or_send(tmp_path, monkeypatch):
+    database_path = tmp_path / "test_leads.db"
+    monkeypatch.setattr(main, "DB_PATH", database_path)
+    invalid_lead = {key: value for key, value in SAMPLE_LEAD.items() if key != "Email"}
+
+    with patch("main.smtplib.SMTP") as smtp_class:
+        with TestClient(main.app) as client:
+            response = client.post("/webhooks/angi", json=invalid_lead)
+
+    assert response.status_code == 422
+    assert any(
+        error["loc"] == ["body", "Email"] and error["type"] == "missing"
+        for error in response.json()["detail"]
+    )
+    with sqlite3.connect(database_path) as connection:
+        row_count = connection.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+
+    assert row_count == 0
+    smtp_class.assert_not_called()
