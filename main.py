@@ -123,6 +123,29 @@ def insert_lead(lead: AngiLead, tenant_id: str, raw_payload: dict) -> int:
         return cursor.lastrowid
 
 
+def find_lead_by_correlation_id(
+    correlation_id: str,
+) -> tuple[int, str, str, str] | None:
+    with sqlite3.connect(DB_PATH) as connection:
+        return connection.execute(
+            """
+            SELECT id, tenant_id, email_status, raw_payload
+            FROM leads
+            WHERE correlation_id = ?
+            ORDER BY
+                CASE email_status
+                    WHEN 'sent' THEN 0
+                    WHEN 'pending' THEN 1
+                    WHEN 'failed' THEN 2
+                    ELSE 3
+                END,
+                id
+            LIMIT 1
+            """,
+            (correlation_id,),
+        ).fetchone()
+
+
 def send_intro_email(lead: AngiLead) -> None:
     required_settings = (
         "SMTP_HOST",
@@ -193,6 +216,31 @@ def mark_email_failed(lead_id: int, error: Exception) -> None:
         )
 
 
+def mark_email_pending(lead_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            """
+            UPDATE leads
+            SET email_status = 'pending', email_sent_at = NULL, email_error = NULL
+            WHERE id = ?
+            """,
+            (lead_id,),
+        )
+
+
+def deliver_intro_email(lead_id: int, lead: AngiLead) -> None:
+    try:
+        send_intro_email(lead)
+    except Exception as error:
+        mark_email_failed(lead_id, error)
+        raise HTTPException(
+            status_code=502,
+            detail="Lead stored, but introductory email could not be sent",
+        ) from error
+
+    mark_email_sent(lead_id)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
@@ -209,16 +257,29 @@ async def receive_angi_lead(lead: AngiLead, request: Request) -> LeadAccepted:
         raise HTTPException(status_code=404, detail="No tenant mapped for ALAccountId")
 
     raw_payload = await request.json()
+    existing_lead = find_lead_by_correlation_id(lead.correlation_id)
+    if existing_lead is not None:
+        lead_id, stored_tenant_id, email_status, stored_payload = existing_lead
+
+        if email_status in {"sent", "pending"}:
+            return LeadAccepted(
+                status="success",
+                lead_id=lead_id,
+                tenant_id=stored_tenant_id,
+            )
+
+        if email_status == "failed":
+            stored_lead = AngiLead.model_validate(json.loads(stored_payload))
+            mark_email_pending(lead_id)
+            deliver_intro_email(lead_id, stored_lead)
+            return LeadAccepted(
+                status="success",
+                lead_id=lead_id,
+                tenant_id=stored_tenant_id,
+            )
+
+        raise HTTPException(status_code=500, detail="Lead has an unknown email status")
+
     lead_id = insert_lead(lead, tenant_id, raw_payload)
-
-    try:
-        send_intro_email(lead)
-    except Exception as error:
-        mark_email_failed(lead_id, error)
-        raise HTTPException(
-            status_code=502,
-            detail="Lead stored, but introductory email could not be sent",
-        ) from error
-
-    mark_email_sent(lead_id)
+    deliver_intro_email(lead_id, lead)
     return LeadAccepted(status="success", lead_id=lead_id, tenant_id=tenant_id)
